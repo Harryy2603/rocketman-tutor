@@ -45,3 +45,5 @@ messages: Persists the chat history for continuous context across sessions.
 concept_memories: Stores the current state of a learned concept (Mastered, Weak, etc.), the AI's confidence score, and the exact transcript quote as evidence.
 
 memory_events: An append-only ledger tracking the delta (+/-) in mastery scores over time to construct the visual learning timeline.
+
+example chats to start: "I know about Docker but confused with images"..

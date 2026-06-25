@@ -17,30 +17,10 @@ const ConceptSchema = z.object({
 
 const MIN_CONFIDENCE_FOR_INFERRED = 0.6;
 
-const PRIMARY_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
-
-// Fallback to OpenAI's OSS 20B (hosted by Groq) in case of rate limits
-const FALLBACK_MODEL = 'openai/gpt-oss-20b' 
-
-async function runExtractionCompletion(
-  systemPrompt: string,
-  userPrompt: string,
-  model: string,
-) {
-  return groq.chat.completions.create({
-    model,
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-  });
-}
-
 function toMatchKey(name: string): string {
   return name
     .toLowerCase()
-    .replace(/\(.*?\)/g, '')      
+    .replace(/\(.*?\)/g, '')     
     .replace(/[^a-z0-9\s]/g, '') 
     .replace(/\s+/g, ' ')
     .trim();
@@ -50,6 +30,7 @@ function isSameConcept(a: string, b: string): boolean {
   const ka = toMatchKey(a);
   const kb = toMatchKey(b);
   if (ka === kb) return true;
+  // One contains the other (e.g. "vm" inside "virtual machine")
   if (ka.split(' ').every(w => kb.includes(w))) return true;
   if (kb.split(' ').every(w => ka.includes(w))) return true;
   return false;
@@ -84,7 +65,14 @@ export async function extractAndSaveMemories(conversationId: string, userId: str
     .map(m => `[${m.role === 'user' ? 'STUDENT' : 'TUTOR'}]: ${m.content}`)
     .join('\n\n');
 
-  const systemPrompt = `You are a learning analytics system that builds a student's knowledge profile from tutoring transcripts.
+  try {
+    const completion = await groq.chat.completions.create({
+      model: 'llama-3.3-70b-versatile',
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `You are a learning analytics system that builds a student's knowledge profile from tutoring transcripts.
 
 Your job is to assess what the STUDENT knows — NOT what the TUTOR explained.
 ${existingNamesBlock}
@@ -117,36 +105,24 @@ Return valid JSON:
       "evidence": ["quote from student"]
     }
   ]
-}`;
+}`,
+        },
+        {
+          role: 'user',
+          content: `Analyze this tutoring transcript. Only assess what the STUDENT demonstrated.\n\n${transcript}`,
+        },
+      ],
+    });
 
-  const userPrompt = `Analyze this tutoring transcript. Only assess what the STUDENT demonstrated.\n\n${transcript}`;
+    const raw = completion.choices[0]?.message?.content ?? '{}';
+    console.log('[Memory] Raw response:', raw.slice(0, 400));
 
-  try {
-    let raw: string;
-    let parsed: unknown;
-    let validated: z.infer<typeof ConceptSchema>;
-
-    try {
-      const completion = await runExtractionCompletion(systemPrompt, userPrompt, PRIMARY_MODEL);
-      raw = completion.choices[0]?.message?.content ?? '{}';
-      console.log('[Memory] Raw response (primary):', raw.slice(0, 400));
-      parsed = JSON.parse(raw);
-      validated = ConceptSchema.parse(parsed);
-    } catch (firstAttemptError) {
-      console.warn(
-        '[Memory] Primary attempt failed, retrying with fallback model:',
-        (firstAttemptError as Error)?.message,
-      );
-      const completion = await runExtractionCompletion(systemPrompt, userPrompt, FALLBACK_MODEL);
-      raw = completion.choices[0]?.message?.content ?? '{}';
-      console.log('[Memory] Raw response (fallback):', raw.slice(0, 400));
-      parsed = JSON.parse(raw);
-      validated = ConceptSchema.parse(parsed);
-    }
-
+    const parsed = JSON.parse(raw);
+    const validated = ConceptSchema.parse(parsed);
     console.log(`[Memory] Extracted ${validated.concepts.length} concepts`);
 
     for (const concept of validated.concepts) {
+      // Skip low-confidence inferred concepts
       if (concept.evidence_source === 'inferred' && concept.confidence < MIN_CONFIDENCE_FOR_INFERRED) {
         console.log(`[Memory] Skipped (inferred, low conf ${concept.confidence}): ${concept.concept_name}`);
         continue;
@@ -163,6 +139,7 @@ Return valid JSON:
       console.log(`[Memory] Concept: "${concept.concept_name}" → stored as "${storedName}" | existing: ${!!existing}`);
 
       if (existing) {
+        // Update by ID — guaranteed to hit the right row regardless of name drift
         const scoreDelta = concept.mastery_score - existing.mastery_score;
         const { error: updateError } = await supabase
           .from('concept_memories')
@@ -188,6 +165,7 @@ Return valid JSON:
         });
         console.log(`[Memory] Updated: "${storedName}" ${existing.mastery_score} → ${concept.mastery_score} (Δ${scoreDelta > 0 ? '+' : ''}${scoreDelta})`);
       } else {
+        // New concept — insert
         const { data: inserted, error: insertError } = await supabase
           .from('concept_memories')
           .insert({

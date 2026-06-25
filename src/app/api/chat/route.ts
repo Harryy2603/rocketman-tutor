@@ -67,7 +67,7 @@ export async function POST(req: Request) {
   const systemPrompt = buildTutorSystemPrompt(memories || []);
 
   const result = streamText({
-    model: groq('gemma2-9b-it'),
+    model: groq('qwen/qwen3.6-27b'),
     system: systemPrompt,
     messages: normalizedMessages,
     onFinish: async ({ text }) => {

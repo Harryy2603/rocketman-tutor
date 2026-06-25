@@ -17,7 +17,7 @@ Run the development server:
 npm run dev
 Click "Start Interactive Demo" on the landing page. This triggers a silent authentication flow for a seamless reviewer experience without requiring manual account creation.
 
-System Architecture & Design
+System Architecture & Design:-
 To avoid a clunky experience where the user has to wait for the AI to both generate an educational response and evaluate their mastery, the architecture strictly decouples the chat stream from the memory extraction.
 
 The Pipeline:

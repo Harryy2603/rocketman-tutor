@@ -1,68 +1,101 @@
 // src/app/api/chat/route.ts
 import { streamText } from 'ai';
-import { google } from '@ai-sdk/google';
+import { createGroq } from '@ai-sdk/groq';
 import { createClient } from '@/lib/supabase/server';
 import { buildTutorSystemPrompt } from '@/lib/ai/prompts';
 import { extractAndSaveMemories } from '@/services/memory-service';
 
-export const maxDuration = 30;
+export const maxDuration = 60;
+
+const groq = createGroq({ apiKey: process.env.GROQ_API_KEY });
+
+// Hardcoded for now — single-user single-conversation demo
+const CONVERSATION_ID = '00000000-0000-0000-0000-000000000000';
 
 export async function POST(req: Request) {
   const supabase = await createClient();
-  const { messages, conversationId } = await req.json();
 
-  // 1. Strict Authentication (Dev bypass removed)
   const { data: { user } } = await supabase.auth.getUser();
-  if (!user) return new Response('Unauthorized', { status: 401 });
+  if (!user) {
+    console.error('[Auth] No user found — returning 401');
+    return new Response('Unauthorized', { status: 401 });
+  }
 
-  // 2. Fetch Learner's Long-Term Memory
+  const body = await req.json();
+  console.log('[Chat] body keys:', Object.keys(body));
+
+  const { messages } = body;
+  const conversationId: string = body.conversationId ?? CONVERSATION_ID;
+  console.log('[Chat] conversationId resolved to:', conversationId);
+  console.log('[Chat] incoming messages:', messages?.length);
+
+  const normalizedMessages = messages.map((msg: any) => {
+    let text = msg.content;
+    if (msg.parts && Array.isArray(msg.parts)) {
+      text = msg.parts
+        .filter((p: any) => p.type === 'text')
+        .map((p: any) => p.text)
+        .join('');
+    }
+    return { role: msg.role, content: text || '' };
+  });
+
+  // Save user message
+  const lastUserMessage = normalizedMessages[normalizedMessages.length - 1];
+  const { error: userMsgError, data: userMsgData } = await supabase
+    .from('messages')
+    .insert({
+      conversation_id: conversationId,
+      role: 'user',
+      content: lastUserMessage.content,
+    })
+    .select()
+    .single();
+
+  if (userMsgError) {
+    console.error('[DB Error - User insert]:', userMsgError.message, userMsgError.details);
+  } else {
+    console.log('[DB] User message saved, id:', userMsgData?.id, 'conv:', conversationId);
+  }
+
+  // Fetch memories + system prompt
   const { data: memories } = await supabase
     .from('concept_memories')
     .select('*')
     .eq('user_id', user.id);
 
-  // 3. Construct System Prompt
   const systemPrompt = buildTutorSystemPrompt(memories || []);
 
-  // 4. Save User Message to DB (With error logging)
-  const lastUserMessage = messages[messages.length - 1];
-  const { error: userMsgError } = await supabase.from('messages').insert({
-    conversation_id: conversationId,
-    role: 'user',
-    content: lastUserMessage.content
-  });
-  
-  if (userMsgError) {
-    console.error('\n[DB Error - User Message]:', userMsgError.message);
-  }
-
-  // 5. Stream AI Response
-  const result = await streamText({
-    model: google('gemini-2.5-flash'),
+  const result = streamText({
+    model: groq('llama-3.3-70b-versatile'),
     system: systemPrompt,
-    messages,
+    messages: normalizedMessages,
     onFinish: async ({ text }) => {
-      // Save AI Response to DB
-      const { error: aiMsgError } = await supabase.from('messages').insert({
-        conversation_id: conversationId,
-        role: 'assistant',
-        content: text
-      });
-      
+      console.log('[onFinish] AI response length:', text.length, 'conv:', conversationId);
+
+      const { error: aiMsgError, data: aiMsgData } = await supabase
+        .from('messages')
+        .insert({
+          conversation_id: conversationId,
+          role: 'assistant',
+          content: text,
+        })
+        .select()
+        .single();
+
       if (aiMsgError) {
-        console.error('\n[DB Error - AI Message]:', aiMsgError.message);
+        console.error('[DB Error - AI insert]:', aiMsgError.message, aiMsgError.details);
+      } else {
+        console.log('[DB] AI message saved, id:', aiMsgData?.id);
       }
-      
-      // Execute the background memory extraction using the real user.id
-      console.log(`\n[System] Starting memory extraction for conversation: ${conversationId}`);
+
       try {
         await extractAndSaveMemories(conversationId, user.id);
-        console.log(`[System] Memory extraction complete.`);
       } catch (error) {
-        console.error(`[System] Memory extraction failed:`, error);
+        console.error('[System] Memory extraction failed:', error);
       }
-    }
+    },
   });
 
-  return result.toTextStreamResponse();
+  return result.toUIMessageStreamResponse();
 }

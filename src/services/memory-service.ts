@@ -17,8 +17,10 @@ const ConceptSchema = z.object({
 
 const MIN_CONFIDENCE_FOR_INFERRED = 0.6;
 
-const PRIMARY_MODEL = 'llama-3.1-8b-instant';
-const FALLBACK_MODEL = 'llama-3.1-8b-instant'; 
+// Switched to Mixtral (different rate limit bucket, excellent at JSON extraction)
+const PRIMARY_MODEL = 'mixtral-8x7b-32768';
+// Fallback to older Llama 3 bucket (different from 3.1)
+const FALLBACK_MODEL = 'llama3-8b-8192'; 
 
 async function runExtractionCompletion(
   systemPrompt: string,
@@ -125,7 +127,6 @@ Return valid JSON:
     let validated: z.infer<typeof ConceptSchema>;
 
     try {
-      // Attempt 1: primary model
       const completion = await runExtractionCompletion(systemPrompt, userPrompt, PRIMARY_MODEL);
       raw = completion.choices[0]?.message?.content ?? '{}';
       console.log('[Memory] Raw response (primary):', raw.slice(0, 400));
@@ -136,7 +137,6 @@ Return valid JSON:
         '[Memory] Primary attempt failed, retrying with fallback model:',
         (firstAttemptError as Error)?.message,
       );
-      // Attempt 2: fallback model (covers rate limits, transient errors, or malformed JSON)
       const completion = await runExtractionCompletion(systemPrompt, userPrompt, FALLBACK_MODEL);
       raw = completion.choices[0]?.message?.content ?? '{}';
       console.log('[Memory] Raw response (fallback):', raw.slice(0, 400));
@@ -147,7 +147,6 @@ Return valid JSON:
     console.log(`[Memory] Extracted ${validated.concepts.length} concepts`);
 
     for (const concept of validated.concepts) {
-      // Skip low-confidence inferred concepts
       if (concept.evidence_source === 'inferred' && concept.confidence < MIN_CONFIDENCE_FOR_INFERRED) {
         console.log(`[Memory] Skipped (inferred, low conf ${concept.confidence}): ${concept.concept_name}`);
         continue;
@@ -164,7 +163,6 @@ Return valid JSON:
       console.log(`[Memory] Concept: "${concept.concept_name}" → stored as "${storedName}" | existing: ${!!existing}`);
 
       if (existing) {
-        // Update by ID — guaranteed to hit the right row regardless of name drift
         const scoreDelta = concept.mastery_score - existing.mastery_score;
         const { error: updateError } = await supabase
           .from('concept_memories')
@@ -190,7 +188,6 @@ Return valid JSON:
         });
         console.log(`[Memory] Updated: "${storedName}" ${existing.mastery_score} → ${concept.mastery_score} (Δ${scoreDelta > 0 ? '+' : ''}${scoreDelta})`);
       } else {
-        // New concept — insert
         const { data: inserted, error: insertError } = await supabase
           .from('concept_memories')
           .insert({

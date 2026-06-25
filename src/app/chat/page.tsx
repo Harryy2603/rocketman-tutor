@@ -93,7 +93,7 @@ export default function ChatPage() {
           {messages.length === 0 && (
             <div className="text-center text-slate-400 mt-20">
               <p className="text-lg font-medium text-slate-200">
-                Hello, Harry.
+                Hello, User !.
               </p>
               <p className="text-sm mt-2">
                 I am RocketMan. What are we studying today?

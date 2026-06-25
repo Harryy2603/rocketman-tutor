@@ -17,6 +17,25 @@ const ConceptSchema = z.object({
 
 const MIN_CONFIDENCE_FOR_INFERRED = 0.6;
 
+function toMatchKey(name: string): string {
+  return name
+    .toLowerCase()
+    .replace(/\(.*?\)/g, '')      
+    .replace(/[^a-z0-9\s]/g, '') 
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isSameConcept(a: string, b: string): boolean {
+  const ka = toMatchKey(a);
+  const kb = toMatchKey(b);
+  if (ka === kb) return true;
+  // One contains the other (e.g. "vm" inside "virtual machine")
+  if (ka.split(' ').every(w => kb.includes(w))) return true;
+  if (kb.split(' ').every(w => ka.includes(w))) return true;
+  return false;
+}
+
 export async function extractAndSaveMemories(conversationId: string, userId: string) {
   console.log('\n[Memory] Starting extraction for conv:', conversationId);
   const supabase = await createClient();
@@ -27,18 +46,21 @@ export async function extractAndSaveMemories(conversationId: string, userId: str
     .eq('conversation_id', conversationId)
     .order('created_at', { ascending: true });
 
-  if (fetchError) {
-    console.error('[Memory] Failed to fetch messages:', fetchError.message);
-    return;
-  }
-  if (!messages || messages.length === 0) {
-    console.log('[Memory] No messages found for conversationId:', conversationId);
-    return;
-  }
+  if (fetchError) { console.error('[Memory] Failed to fetch messages:', fetchError.message); return; }
+  if (!messages?.length) { console.log('[Memory] No messages found'); return; }
 
   console.log('[Memory] Found', messages.length, 'messages to analyze');
 
-  // Label each line clearly so the LLM can distinguish who said what
+  const { data: existingConcepts } = await supabase
+    .from('concept_memories')
+    .select('id, concept_name, mastery_score, status')
+    .eq('user_id', userId);
+
+  const existingList = existingConcepts ?? [];
+  const existingNamesBlock = existingList.length > 0
+    ? `\nEXISTING CONCEPTS IN MEMORY (use these EXACT names if the concept matches):\n${existingList.map(c => `- "${c.concept_name}" (current: ${c.status}, ${c.mastery_score}%)`).join('\n')}\n`
+    : '';
+
   const transcript = messages
     .map(m => `[${m.role === 'user' ? 'STUDENT' : 'TUTOR'}]: ${m.content}`)
     .join('\n\n');
@@ -53,104 +75,73 @@ export async function extractAndSaveMemories(conversationId: string, userId: str
           content: `You are a learning analytics system that builds a student's knowledge profile from tutoring transcripts.
 
 Your job is to assess what the STUDENT knows — NOT what the TUTOR explained.
-
+${existingNamesBlock}
 CRITICAL RULES:
-1. Only include a concept if the STUDENT gave evidence of knowing or not knowing it.
-   - The student asking a question about X = weak signal (low mastery, low confidence).
-   - The student explaining X correctly = strong signal (higher mastery).
-   - The student saying "I know X" explicitly = strong prior knowledge signal.
-   - The TUTOR explaining X, with NO student response about it = DO NOT include it, or mark evidence_source as "inferred" with very low confidence (< 0.4).
+1. If the concept already exists in memory (see list above), use the EXACT same concept_name string.
+   Do NOT rename it, abbreviate it, or create a variant. Copy it character-for-character.
 
-2. evidence must be a direct quote from a STUDENT message, not the tutor's explanation.
-   If you cannot find a student quote for a concept, set evidence_source to "inferred"
-   and quote the student's original request that implied the gap.
+2. Only include a concept if the STUDENT gave evidence:
+   - "I know X" / "I understand X now" = strong prior/learned knowledge (mastery 70-90)
+   - "I'm confused about X" / asking about X = weak/gap (mastery 10-25)
+   - "I somewhat understand X" / "not clearly but somewhat" = developing (mastery 30-50)
+   - Student correctly explains X = proficient/mastered (mastery 60-90)
+   - Tutor explained X, student gave NO response = DO NOT include, or inferred + confidence < 0.4
 
-3. mastery_score guidelines:
-   - Student explicitly claims prior knowledge ("I know what X is"): 70–90
-   - Student asks a clear question showing they want to learn X: 10–25
-   - Student follows up with a deeper question about X: 30–50 (developing)
-   - Student correctly explains X themselves: 60–85
-   - TUTOR mentioned X in passing, student never reacted: 0–20, evidence_source = "inferred"
+3. mastery_score 0-100 based on student evidence only.
 
-4. confidence reflects how certain you are of your assessment (0–1).
-   Low confidence (< 0.5) = little student evidence. High confidence (> 0.7) = clear student signal.
+4. evidence = JSON array of direct quotes from STUDENT messages only. Never from tutor.
 
-5. Do NOT inflate scores. A student who just heard about a concept for the first time
-   should NOT be scored above 30 on that concept.
+5. evidence_source = "student" if there's a direct student quote; "inferred" if you had to infer.
 
-6. evidence is a JSON ARRAY of short direct quotes from STUDENT messages only.
-   - Always use an array, even for a single quote: ["quote here"]
-   - If the student said multiple things about a concept across the conversation,
-     include each as a separate array element: ["first quote", "later quote"]
-   - NEVER put multiple quotes in one string. NEVER use commas between quoted strings.
-   - Each element must be a valid JSON string — no trailing commas, no extra keys.
-
-Return valid JSON in exactly this format:
+Return valid JSON:
 {
   "concepts": [
     {
-      "concept_name": "string",
+      "concept_name": "string (exact match from existing list if applicable)",
       "status": "weak|developing|proficient|mastered",
-      "mastery_score": number 0–100,
-      "confidence": number 0–1,
+      "mastery_score": 0-100,
+      "confidence": 0.0-1.0,
       "evidence_source": "student|inferred",
-      "evidence": ["quote one from student", "quote two from student"]
+      "evidence": ["quote from student"]
     }
   ]
 }`,
         },
         {
           role: 'user',
-          content: `Analyze this tutoring transcript and extract the student's concept mastery profile.\nOnly assess what the STUDENT demonstrated — not what the TUTOR taught.\n\n${transcript}`,
+          content: `Analyze this tutoring transcript. Only assess what the STUDENT demonstrated.\n\n${transcript}`,
         },
       ],
     });
 
     const raw = completion.choices[0]?.message?.content ?? '{}';
-    console.log('[Memory] Raw response:', raw.slice(0, 300));
+    console.log('[Memory] Raw response:', raw.slice(0, 400));
 
     const parsed = JSON.parse(raw);
     const validated = ConceptSchema.parse(parsed);
-
     console.log(`[Memory] Extracted ${validated.concepts.length} concepts`);
 
     for (const concept of validated.concepts) {
-      // Skip AI-only concepts that don't meet the confidence bar
-      if (
-        concept.evidence_source === 'inferred' &&
-        concept.confidence < MIN_CONFIDENCE_FOR_INFERRED
-      ) {
-        console.log(
-          `[Memory] Skipped (inferred, low confidence): ${concept.concept_name} (conf: ${concept.confidence})`
-        );
+      // Skip low-confidence inferred concepts
+      if (concept.evidence_source === 'inferred' && concept.confidence < MIN_CONFIDENCE_FOR_INFERRED) {
+        console.log(`[Memory] Skipped (inferred, low conf ${concept.confidence}): ${concept.concept_name}`);
         continue;
       }
 
-      const normalizedName = concept.concept_name
-        .trim()
-        .toLowerCase()
-        .replace(/\b\w/g, c => c.toUpperCase());
-
-      const { data: existingRows, error: lookupError } = await supabase
-        .from('concept_memories')
-        .select('*')
-        .eq('user_id', userId)
-        .ilike('concept_name', normalizedName)
-        .limit(1);
-
-      if (lookupError) {
-        console.error(`[Memory] Lookup error for "${normalizedName}":`, lookupError.message);
-        continue;
-      }
-
-      const existing = existingRows?.[0] ?? null;
-
-      // Flatten evidence array to a single string for storage
       const evidenceText = concept.evidence.join(' → ');
 
+      let existing = existingList.find(e => isSameConcept(e.concept_name, concept.concept_name)) ?? null;
+
+      const storedName = existing
+        ? existing.concept_name
+        : concept.concept_name.trim().replace(/\b\w/g, c => c.toUpperCase());
+
+      console.log(`[Memory] Concept: "${concept.concept_name}" → stored as "${storedName}" | existing: ${!!existing}`);
+
       if (existing) {
+        // Update by ID — guaranteed to hit the right row regardless of name drift
         const scoreDelta = concept.mastery_score - existing.mastery_score;
-        await supabase
+        const { error: updateError } = await supabase
           .from('concept_memories')
           .update({
             status: concept.status,
@@ -161,19 +152,25 @@ Return valid JSON in exactly this format:
           })
           .eq('id', existing.id);
 
+        if (updateError) {
+          console.error(`[Memory] Update error for "${storedName}":`, updateError.message);
+          continue;
+        }
+
         await supabase.from('memory_events').insert({
           memory_id: existing.id,
           conversation_id: conversationId,
           score_delta: scoreDelta,
           reasoning: evidenceText,
         });
-        console.log('[Memory] Updated:', normalizedName);
+        console.log(`[Memory] Updated: "${storedName}" ${existing.mastery_score} → ${concept.mastery_score} (Δ${scoreDelta > 0 ? '+' : ''}${scoreDelta})`);
       } else {
+        // New concept — insert
         const { data: inserted, error: insertError } = await supabase
           .from('concept_memories')
           .insert({
             user_id: userId,
-            concept_name: normalizedName,
+            concept_name: storedName,
             status: concept.status,
             mastery_score: concept.mastery_score,
             evidence: evidenceText,
@@ -183,7 +180,7 @@ Return valid JSON in exactly this format:
           .single();
 
         if (insertError) {
-          console.error(`[Memory] Insert error for "${normalizedName}":`, insertError.message);
+          console.error(`[Memory] Insert error for "${storedName}":`, insertError.message);
           continue;
         }
 
@@ -194,7 +191,7 @@ Return valid JSON in exactly this format:
             score_delta: concept.mastery_score,
             reasoning: 'Initial assessment.',
           });
-          console.log('[Memory] Inserted:', normalizedName);
+          console.log(`[Memory] Inserted: "${storedName}" at ${concept.mastery_score}%`);
         }
       }
     }

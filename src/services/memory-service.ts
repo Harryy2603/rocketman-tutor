@@ -17,6 +17,24 @@ const ConceptSchema = z.object({
 
 const MIN_CONFIDENCE_FOR_INFERRED = 0.6;
 
+const PRIMARY_MODEL = 'llama-3.1-8b-instant';
+const FALLBACK_MODEL = 'llama-3.1-8b-instant'; 
+
+async function runExtractionCompletion(
+  systemPrompt: string,
+  userPrompt: string,
+  model: string,
+) {
+  return groq.chat.completions.create({
+    model,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userPrompt },
+    ],
+  });
+}
+
 function toMatchKey(name: string): string {
   return name
     .toLowerCase()
@@ -30,7 +48,6 @@ function isSameConcept(a: string, b: string): boolean {
   const ka = toMatchKey(a);
   const kb = toMatchKey(b);
   if (ka === kb) return true;
-  // One contains the other (e.g. "vm" inside "virtual machine")
   if (ka.split(' ').every(w => kb.includes(w))) return true;
   if (kb.split(' ').every(w => ka.includes(w))) return true;
   return false;
@@ -65,14 +82,7 @@ export async function extractAndSaveMemories(conversationId: string, userId: str
     .map(m => `[${m.role === 'user' ? 'STUDENT' : 'TUTOR'}]: ${m.content}`)
     .join('\n\n');
 
-  try {
-    const completion = await groq.chat.completions.create({
-      model: 'llama-3.3-70b-versatile',
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content: `You are a learning analytics system that builds a student's knowledge profile from tutoring transcripts.
+  const systemPrompt = `You are a learning analytics system that builds a student's knowledge profile from tutoring transcripts.
 
 Your job is to assess what the STUDENT knows — NOT what the TUTOR explained.
 ${existingNamesBlock}
@@ -105,20 +115,35 @@ Return valid JSON:
       "evidence": ["quote from student"]
     }
   ]
-}`,
-        },
-        {
-          role: 'user',
-          content: `Analyze this tutoring transcript. Only assess what the STUDENT demonstrated.\n\n${transcript}`,
-        },
-      ],
-    });
+}`;
 
-    const raw = completion.choices[0]?.message?.content ?? '{}';
-    console.log('[Memory] Raw response:', raw.slice(0, 400));
+  const userPrompt = `Analyze this tutoring transcript. Only assess what the STUDENT demonstrated.\n\n${transcript}`;
 
-    const parsed = JSON.parse(raw);
-    const validated = ConceptSchema.parse(parsed);
+  try {
+    let raw: string;
+    let parsed: unknown;
+    let validated: z.infer<typeof ConceptSchema>;
+
+    try {
+      // Attempt 1: primary model
+      const completion = await runExtractionCompletion(systemPrompt, userPrompt, PRIMARY_MODEL);
+      raw = completion.choices[0]?.message?.content ?? '{}';
+      console.log('[Memory] Raw response (primary):', raw.slice(0, 400));
+      parsed = JSON.parse(raw);
+      validated = ConceptSchema.parse(parsed);
+    } catch (firstAttemptError) {
+      console.warn(
+        '[Memory] Primary attempt failed, retrying with fallback model:',
+        (firstAttemptError as Error)?.message,
+      );
+      // Attempt 2: fallback model (covers rate limits, transient errors, or malformed JSON)
+      const completion = await runExtractionCompletion(systemPrompt, userPrompt, FALLBACK_MODEL);
+      raw = completion.choices[0]?.message?.content ?? '{}';
+      console.log('[Memory] Raw response (fallback):', raw.slice(0, 400));
+      parsed = JSON.parse(raw);
+      validated = ConceptSchema.parse(parsed);
+    }
+
     console.log(`[Memory] Extracted ${validated.concepts.length} concepts`);
 
     for (const concept of validated.concepts) {

@@ -17,10 +17,10 @@ const ConceptSchema = z.object({
 
 const MIN_CONFIDENCE_FOR_INFERRED = 0.6;
 
-// Switched to Mixtral (different rate limit bucket, excellent at JSON extraction)
-const PRIMARY_MODEL = 'mixtral-8x7b-32768';
-// Fallback to older Llama 3 bucket (different from 3.1)
-const FALLBACK_MODEL = 'llama3-8b-8192'; 
+const PRIMARY_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+// Fallback to OpenAI's OSS 20B (hosted by Groq) in case of rate limits
+const FALLBACK_MODEL = 'openai/gpt-oss-20b' 
 
 async function runExtractionCompletion(
   systemPrompt: string,
